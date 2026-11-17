@@ -18,12 +18,12 @@ StartLimitIntervalSec=0
 Type=simple
 EnvironmentFile=/etc/system-protector/%i.conf
 
-# WorkingDirectory/User come from the conf file via systemd specifiers below.
-WorkingDirectory=${WORKDIR}
-
-# Run the watchdog, which runs your command through a shell so COMMAND can be
-# a full command line with arguments.
-ExecStart=/usr/local/bin/protector --name %i --logfile /var/log/system-protector/%i.log -- /bin/sh -c "exec ${COMMAND}"
+# Run the watchdog, which runs your command through a shell so COMMAND can be a
+# full command line with arguments. We cd into WORKDIR inside the shell instead
+# of using systemd's WorkingDirectory=, because systemd does NOT expand ${VAR}
+# in WorkingDirectory= (only in command lines). The "$$" escapes the dollar so
+# systemd passes it through and the shell expands WORKDIR/COMMAND at runtime.
+ExecStart=/usr/local/bin/protector --name %i --logfile /var/log/system-protector/%i.log -- /bin/sh -c "cd $${WORKDIR:-/} && exec $${COMMAND}"
 
 # Layer 2: if the watchdog itself dies, systemd brings it right back.
 Restart=always
