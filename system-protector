@@ -131,10 +131,59 @@ ensure_installed() {
 # =====================================================================
 # add a protected program
 # =====================================================================
+# After start, warn if the WATCHDOG is up but the command is crash-looping
+# (child exits almost instantly). The watchdog keeps retrying either way.
+peek_child_health() { # LOGFILE NAME
+  local lf="$1" nm="$2"
+  [ -f "$lf" ] || return 0
+  if tail -n 20 "$lf" | grep -qiE 'exec .* failed|restarting in [0-9]|exited with code [1-9]|code 127'; then
+    warn "'$nm' is running, but the command is exiting right away (crash loop)."
+    say "${B}    last log lines:${N}"
+    tail -n 6 "$lf" | sed 's/^/    /'
+    warn "The watchdog keeps retrying. Check the command/arguments in the config."
+  fi
+}
+
+# Validate a command + workdir before we commit to creating a service.
+# Returns 0 to proceed (possibly after the user says "anyway"), 1 to abort.
+preflight_command() { # COMMAND WORKDIR
+  local cmd="$1" wd="$2" exe arg full
+  exe="$(printf '%s' "$cmd" | awk '{print $1}')"
+  if ! command -v "$exe" >/dev/null 2>&1 && [ ! -x "$exe" ]; then
+    warn "'$exe' was not found on PATH."
+    full="$(command -v "${exe##*/}" 2>/dev/null || true)"
+    [ -n "$full" ] && warn "systemd/cron use a minimal PATH — prefer the absolute path: $full"
+    confirm "Use '$exe' anyway?" || return 1
+  fi
+  if [ -z "$wd" ]; then
+    warn "No working directory given; it will default to /."
+  elif [ ! -d "$wd" ]; then
+    warn "Working directory '$wd' does not exist."
+    if confirm "Create it now?"; then
+      mkdir -p "$wd" 2>/dev/null || { err "Could not create $wd"; return 1; }
+      ok "Created $wd"
+    else
+      confirm "Continue without it?" || return 1
+    fi
+  fi
+  for arg in $cmd; do
+    case "$arg" in
+      *://*) : ;;                       # a URL — not a file
+      /*|./*|../*)
+        if [ ! -e "$arg" ] && { [ -z "$wd" ] || [ ! -e "$wd/$arg" ]; }; then
+          warn "'$arg' looks like a file path but doesn't exist (yet)."
+        fi ;;
+    esac
+  done
+  return 0
+}
+
 add_systemd() { # NAME COMMAND WORKDIR
   local name="$1" command="$2" workdir="$3"
   is_root || die "Setting up a systemd service needs root. Re-run:  sudo $0 add"
-  [ -L "$UNIT_LINK" ] || [ -f "$UNIT_LINK" ] || { ln -sfn "$UNIT_SRC" "$UNIT_LINK"; systemctl daemon-reload; }
+  [ -e "$BIN_SRC" ] || build_binary
+  [ -e "$BIN_LINK" ] || ln -sfn "$BIN_SRC" "$BIN_LINK"
+  [ -L "$UNIT_LINK" ] || [ -f "$UNIT_LINK" ] || ln -sfn "$UNIT_SRC" "$UNIT_LINK"
   mkdir -p "$CONFDIR" "$LOGDIR"
   local conf="$CONFDIR/$name.conf"
   {
@@ -142,19 +191,45 @@ add_systemd() { # NAME COMMAND WORKDIR
     echo "WORKDIR=$workdir"
   } > "$conf"
   ok "Wrote $conf"
-  systemctl daemon-reload
-  systemctl enable --now "system-protector@$name"
-  ok "Enabled + started: system-protector@$name"
+  systemctl daemon-reload || true
+
+  ok "Starting system-protector@$name ..."
+  systemctl enable "system-protector@$name" >/dev/null 2>&1 || true
+  systemctl start "system-protector@$name" >/dev/null 2>&1 || true
+  sleep 1
+
+  if systemctl is-active --quiet "system-protector@$name"; then
+    ok "Running."
+    say ""
+    systemctl --no-pager --full status "system-protector@$name" 2>/dev/null | sed -n '1,6p' || true
+    say ""
+    peek_child_health "$LOGDIR/$name.log" "$name"
+    ok "Logs:  ${B}system-protector logs $name${N}   or   tail -f $LOGDIR/$name.log"
+    return 0
+  fi
+
+  # ---- it didn't start: show the real reason instead of claiming success ----
+  err "system-protector@$name did NOT start. Here's why:"
   say ""
-  systemctl --no-pager --full status "system-protector@$name" | sed -n '1,6p' || true
+  systemctl --no-pager --full status "system-protector@$name" 2>&1 | sed -n '1,8p' || true
   say ""
-  ok "Logs:  ${B}system-protector logs $name${N}   or   tail -f $LOGDIR/$name.log"
+  say "${B}Recent log:${N}"
+  journalctl -u "system-protector@$name" -n 15 --no-pager 2>&1 | tail -n 15 || true
+  say ""
+  say "${B}Config ($conf):${N}"
+  sed 's/^/    /' "$conf" 2>/dev/null || true
+  say ""
+  warn "Usual causes: the command/interpreter isn't an absolute path, or WORKDIR is wrong."
+  warn "Edit the config, then:  systemctl restart system-protector@$name"
+  return 1
 }
 
 add_cron() { # NAME COMMAND WORKDIR
   local name="$1" command="$2" workdir="$3"
   mkdir -p "$UBIN" "$URUN"
+  [ -e "$BIN_SRC" ] || build_binary
   [ -e "$UBIN/protector" ] || ln -sfn "$BIN_SRC" "$UBIN/protector"
+  [ -n "$workdir" ] || workdir="/"
   local pidfile="$URUN/$name.pid" logfile="$URUN/$name.log" guard="$URUN/guard-$name.sh"
   cat > "$guard" <<GUARD
 #!/usr/bin/env bash
@@ -166,14 +241,33 @@ cd "$workdir" 2>/dev/null || exit 1
 exec "$UBIN/protector" --name "$name" --pidfile "\$PIDFILE" --logfile "$logfile" --daemon -- /bin/sh -c "exec $command"
 GUARD
   chmod +x "$guard"
-  local tmp; tmp="$(mktemp)"
-  crontab -l 2>/dev/null | grep -v "guard-$name.sh" > "$tmp" || true
-  echo "@reboot $guard" >> "$tmp"
-  echo "* * * * * $guard" >> "$tmp"
-  crontab "$tmp"; rm -f "$tmp"
-  "$guard"
-  ok "Started with cron fallback (revives the watchdog within a minute if it dies)."
-  ok "Logs:  tail -f $logfile"
+  if command -v crontab >/dev/null 2>&1; then
+    local tmp; tmp="$(mktemp)"
+    crontab -l 2>/dev/null | grep -v "guard-$name.sh" > "$tmp" || true
+    echo "@reboot $guard" >> "$tmp"
+    echo "* * * * * $guard" >> "$tmp"
+    crontab "$tmp" || warn "Could not install crontab entry (watchdog still started once below)."
+    rm -f "$tmp"
+  else
+    warn "No crontab available — the watchdog will run, but won't auto-revive after a reboot or if it's killed."
+  fi
+
+  "$guard" || true
+  sleep 1
+  if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    ok "Running (cron fallback: revives the watchdog within a minute if it dies)."
+    peek_child_health "$logfile" "$name"
+    ok "Logs:  system-protector logs $name   or   tail -f $logfile"
+    return 0
+  fi
+
+  # ---- didn't come up: show why ----
+  err "The watchdog for '$name' did NOT start. Recent log:"
+  say ""
+  if [ -f "$logfile" ]; then tail -n 15 "$logfile" | sed 's/^/    /'; else say "    (no log written — the command may be invalid)"; fi
+  say ""
+  warn "Usual causes: the command/interpreter isn't an absolute path, or WORKDIR ('$workdir') is wrong."
+  return 1
 }
 
 cmd_add() {
@@ -203,6 +297,7 @@ cmd_add() {
   fi
   say ""
   confirm "Create it?" || { warn "Cancelled."; return 0; }
+  preflight_command "$COMMAND" "$WORKDIR" || { warn "Cancelled."; return 0; }
   if have_systemd && is_root; then
     add_systemd "$NAME" "$COMMAND" "$WORKDIR"
   elif have_systemd && ! is_root; then
@@ -315,14 +410,14 @@ menu() {
     say "  0) Exit"
     local ch=""; read -r -p "> " ch || true
     case "$ch" in
-      1) cmd_add ;;
-      2) say ""; cmd_list ;;
-      3) cmd_status ;;
-      4) cmd_logs ;;
-      5) cmd_remove ;;
-      6) self_install ;;
-      7) [ -x "$REPO/update.sh" ] && "$REPO/update.sh" || warn "update.sh not found." ;;
-      8) cmd_uninstall ;;
+      1) cmd_add || true ;;
+      2) say ""; cmd_list || true ;;
+      3) cmd_status || true ;;
+      4) cmd_logs || true ;;
+      5) cmd_remove || true ;;
+      6) self_install || true ;;
+      7) { [ -x "$REPO/update.sh" ] && "$REPO/update.sh"; } || warn "update failed or update.sh not found." ;;
+      8) cmd_uninstall || true ;;
       0|q|Q) exit 0 ;;
       "") : ;;
       *) warn "Unknown choice." ;;
