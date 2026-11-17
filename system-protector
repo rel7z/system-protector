@@ -1,0 +1,357 @@
+#!/usr/bin/env bash
+#
+# system-protector — interactive manager + self-installer for the watchdog.
+#
+# Run with no arguments for the interactive menu:   ./system-protector
+# Or use subcommands directly:
+#     system-protector self-install        build + symlink onto PATH
+#     system-protector add                 set up a new protected program
+#     system-protector list                list protected programs
+#     system-protector status <name>       show status
+#     system-protector logs <name>         tail logs
+#     system-protector remove <name>       stop + remove a program
+#     system-protector uninstall           remove system-protector itself
+#
+set -euo pipefail
+
+# ---- resolve where this script really lives (following symlinks) ----
+resolve() {
+  if command -v readlink >/dev/null 2>&1 && readlink -f "$1" >/dev/null 2>&1; then
+    readlink -f "$1"
+  else
+    local p="$1"
+    while [ -L "$p" ]; do p="$(cd "$(dirname "$p")" && pwd)/$(basename "$(readlink "$p")")"; done
+    echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+  fi
+}
+SCRIPT="$(resolve "$0")"
+REPO="$(dirname "$SCRIPT")"
+
+# ---- locations ----
+BIN_SRC="$REPO/protector"
+BIN_LINK="/usr/local/bin/protector"
+CLI_LINK="/usr/local/bin/system-protector"
+UNIT_SRC="$REPO/systemd/system-protector@.service"
+UNIT_LINK="/etc/systemd/system/system-protector@.service"
+CONFDIR="/etc/system-protector"
+LOGDIR="/var/log/system-protector"
+
+# per-user (cron fallback) locations
+UBIN="$HOME/.local/bin"
+URUN="$HOME/.local/share/system-protector"
+
+# ---- colors (disabled if not a tty) ----
+if [ -t 1 ]; then
+  B=$'\033[1m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; C=$'\033[36m'; N=$'\033[0m'
+else
+  B=""; G=""; Y=""; R=""; C=""; N=""
+fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s>>%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!!%s %s\n' "$Y" "$N" "$*"; }
+err()  { printf '%s** %s%s\n' "$R" "$*" "$N" >&2; }
+die()  { err "$*"; exit 1; }
+
+is_root()      { [ "$(id -u)" -eq 0 ]; }
+have_systemd() { command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; }
+have_cc()      { command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; }
+CC()           { command -v cc >/dev/null 2>&1 && echo cc || echo gcc; }
+
+ask() { # ask VARNAME "prompt" ["default"]
+  local __v="$1" __p="$2" __d="${3:-}" __in=""
+  if [ -n "$__d" ]; then
+    read -r -p "$__p [$__d]: " __in || true
+    [ -z "$__in" ] && __in="$__d"
+  else
+    read -r -p "$__p: " __in || true
+  fi
+  printf -v "$__v" '%s' "$__in"
+}
+
+confirm() { # confirm "question" -> 0 for yes
+  local a=""
+  read -r -p "$1 [y/N]: " a || true
+  case "$a" in y|Y|yes|YES) return 0;; *) return 1;; esac
+}
+
+build_binary() {
+  have_cc || die "No C compiler found. Install one, e.g.:  sudo apt install build-essential"
+  ok "Building watchdog -> $BIN_SRC"
+  "$(CC)" -O2 -Wall -Wextra -o "$BIN_SRC" "$REPO/protector.c"
+}
+
+# =====================================================================
+# self-install:  build + symlink binary and this CLI onto PATH
+# =====================================================================
+self_install() {
+  build_binary
+  if is_root; then
+    ok "Symlinking $BIN_LINK -> $BIN_SRC"
+    ln -sfn "$BIN_SRC" "$BIN_LINK"
+    ok "Symlinking $CLI_LINK -> $SCRIPT"
+    ln -sfn "$SCRIPT" "$CLI_LINK"
+    chmod +x "$SCRIPT"
+    if have_systemd; then
+      ok "Symlinking systemd unit $UNIT_LINK -> $UNIT_SRC"
+      ln -sfn "$UNIT_SRC" "$UNIT_LINK"
+      mkdir -p "$CONFDIR" "$LOGDIR"
+      systemctl daemon-reload
+    else
+      warn "systemd not detected — programs will use the per-user cron fallback."
+    fi
+    ok "Done. You can now run:  ${B}system-protector${N}"
+  else
+    mkdir -p "$UBIN" "$URUN"
+    ok "Symlinking $UBIN/protector -> $BIN_SRC"
+    ln -sfn "$BIN_SRC" "$UBIN/protector"
+    ok "Symlinking $UBIN/system-protector -> $SCRIPT"
+    ln -sfn "$SCRIPT" "$UBIN/system-protector"
+    chmod +x "$SCRIPT"
+    case ":$PATH:" in
+      *":$UBIN:"*) : ;;
+      *) warn "Add $UBIN to your PATH:  echo 'export PATH=\"\$HOME/.local/bin:\$PATH\"' >> ~/.bashrc" ;;
+    esac
+    ok "Installed for the current user (no root). systemd features need 'sudo $0 self-install'."
+  fi
+}
+
+installed() { [ -e "$BIN_LINK" ] || [ -e "$UBIN/protector" ]; }
+
+ensure_installed() {
+  if ! installed; then
+    warn "system-protector is not installed yet."
+    if confirm "Install it now (build + symlink onto PATH)?"; then
+      self_install
+    else
+      die "Cannot continue without installing."
+    fi
+  fi
+}
+
+# =====================================================================
+# add a protected program
+# =====================================================================
+add_systemd() { # NAME COMMAND WORKDIR
+  local name="$1" command="$2" workdir="$3"
+  is_root || die "Setting up a systemd service needs root. Re-run:  sudo $0 add"
+  [ -L "$UNIT_LINK" ] || [ -f "$UNIT_LINK" ] || { ln -sfn "$UNIT_SRC" "$UNIT_LINK"; systemctl daemon-reload; }
+  mkdir -p "$CONFDIR" "$LOGDIR"
+  local conf="$CONFDIR/$name.conf"
+  {
+    echo "COMMAND=$command"
+    echo "WORKDIR=$workdir"
+  } > "$conf"
+  ok "Wrote $conf"
+  systemctl daemon-reload
+  systemctl enable --now "system-protector@$name"
+  ok "Enabled + started: system-protector@$name"
+  say ""
+  systemctl --no-pager --full status "system-protector@$name" | sed -n '1,6p' || true
+  say ""
+  ok "Logs:  ${B}system-protector logs $name${N}   or   tail -f $LOGDIR/$name.log"
+}
+
+add_cron() { # NAME COMMAND WORKDIR
+  local name="$1" command="$2" workdir="$3"
+  mkdir -p "$UBIN" "$URUN"
+  [ -e "$UBIN/protector" ] || ln -sfn "$BIN_SRC" "$UBIN/protector"
+  local pidfile="$URUN/$name.pid" logfile="$URUN/$name.log" guard="$URUN/guard-$name.sh"
+  cat > "$guard" <<GUARD
+#!/usr/bin/env bash
+PIDFILE="$pidfile"
+if [ -f "\$PIDFILE" ] && kill -0 "\$(cat "\$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+  exit 0
+fi
+cd "$workdir" 2>/dev/null || exit 1
+exec "$UBIN/protector" --name "$name" --pidfile "\$PIDFILE" --logfile "$logfile" --daemon -- /bin/sh -c "exec $command"
+GUARD
+  chmod +x "$guard"
+  local tmp; tmp="$(mktemp)"
+  crontab -l 2>/dev/null | grep -v "guard-$name.sh" > "$tmp" || true
+  echo "@reboot $guard" >> "$tmp"
+  echo "* * * * * $guard" >> "$tmp"
+  crontab "$tmp"; rm -f "$tmp"
+  "$guard"
+  ok "Started with cron fallback (revives the watchdog within a minute if it dies)."
+  ok "Logs:  tail -f $logfile"
+}
+
+cmd_add() {
+  ensure_installed
+  local NAME COMMAND WORKDIR
+  say "${B}Set up a new protected program${N}"
+  ask NAME "Short name (letters, digits, dash)" "myapp"
+  NAME="$(printf '%s' "$NAME" | tr -cs 'A-Za-z0-9_-' '-')"
+  [ -n "$NAME" ] || die "Empty name."
+  ask COMMAND "Full command to keep running" "python3 /opt/$NAME/app.py"
+  [ -n "$COMMAND" ] || die "Empty command."
+  local first guess
+  first="$(printf '%s' "$COMMAND" | awk '{for(i=1;i<=NF;i++) if($i ~ /\//){print $i; exit}}')"
+  guess="$(dirname "$first" 2>/dev/null || true)"
+  { [ -z "$guess" ] || [ "$guess" = "." ]; } && guess="$HOME"
+  ask WORKDIR "Working directory" "$guess"
+  say ""
+  say "  name:    ${C}$NAME${N}"
+  say "  command: ${C}$COMMAND${N}"
+  say "  workdir: ${C}$WORKDIR${N}"
+  if have_systemd && is_root; then
+    say "  method:  ${C}systemd${N} (two-layer protection)"
+  elif have_systemd && ! is_root; then
+    say "  method:  ${C}systemd${N} — ${Y}needs sudo${N}"
+  else
+    say "  method:  ${C}cron fallback${N} (per-user)"
+  fi
+  say ""
+  confirm "Create it?" || { warn "Cancelled."; return 0; }
+  if have_systemd && is_root; then
+    add_systemd "$NAME" "$COMMAND" "$WORKDIR"
+  elif have_systemd && ! is_root; then
+    die "Re-run with sudo for the systemd method:  sudo $0 add"
+  else
+    add_cron "$NAME" "$COMMAND" "$WORKDIR"
+  fi
+}
+
+# =====================================================================
+# list / status / logs / remove
+# =====================================================================
+cmd_list() {
+  local found=0
+  if have_systemd && [ -d "$CONFDIR" ]; then
+    for c in "$CONFDIR"/*.conf; do
+      [ -e "$c" ] || continue
+      [ "$(basename "$c")" = "example.conf" ] && continue
+      local n st
+      n="$(basename "$c" .conf)"; found=1
+      st="$(systemctl is-active "system-protector@$n" 2>/dev/null || echo '?')"
+      printf '  %-20s %s[%s]%s  (systemd)\n' "$n" "$C" "$st" "$N"
+    done
+  fi
+  if [ -d "$URUN" ]; then
+    for g in "$URUN"/guard-*.sh; do
+      [ -e "$g" ] || continue
+      local n st
+      n="$(basename "$g" .sh)"; n="${n#guard-}"; found=1
+      st="dead"
+      [ -f "$URUN/$n.pid" ] && kill -0 "$(cat "$URUN/$n.pid" 2>/dev/null)" 2>/dev/null && st="alive"
+      printf '  %-20s %s[%s]%s  (cron)\n' "$n" "$C" "$st" "$N"
+    done
+  fi
+  [ "$found" -eq 1 ] || say "  (none yet — use 'add')"
+}
+
+cmd_status() {
+  local n="${1:-}"; [ -n "$n" ] || ask n "Which program?"
+  [ -n "$n" ] || return 0
+  if have_systemd && [ -f "$CONFDIR/$n.conf" ]; then
+    systemctl --no-pager --full status "system-protector@$n" || true
+  elif [ -f "$URUN/$n.pid" ]; then
+    local p; p="$(cat "$URUN/$n.pid" 2>/dev/null || echo)"
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then ok "$n: watchdog alive (pid $p)"; else warn "$n: watchdog not running"; fi
+  else
+    warn "No program named '$n'."
+  fi
+}
+
+cmd_logs() {
+  local n="${1:-}"; [ -n "$n" ] || ask n "Which program?"
+  [ -n "$n" ] || return 0
+  local f=""
+  [ -f "$LOGDIR/$n.log" ] && f="$LOGDIR/$n.log"
+  [ -z "$f" ] && [ -f "$URUN/$n.log" ] && f="$URUN/$n.log"
+  [ -n "$f" ] || die "No log file found for '$n'."
+  ok "Tailing $f  (Ctrl-C to stop)"
+  tail -n 40 -f "$f"
+}
+
+cmd_remove() {
+  local n="${1:-}"; [ -n "$n" ] || ask n "Which program to remove?"
+  [ -n "$n" ] || return 0
+  if have_systemd && [ -f "$CONFDIR/$n.conf" ]; then
+    is_root || die "Removing a systemd service needs root:  sudo $0 remove $n"
+    systemctl disable --now "system-protector@$n" || true
+    rm -f "${CONFDIR:?}/${n:?}.conf"
+    ok "Removed systemd program '$n' (log left at $LOGDIR/$n.log)."
+  elif [ -f "$URUN/guard-$n.sh" ]; then
+    local tmp; tmp="$(mktemp)"
+    crontab -l 2>/dev/null | grep -v "guard-$n.sh" > "$tmp" || true
+    crontab "$tmp"; rm -f "$tmp"
+    [ -f "$URUN/$n.pid" ] && kill "$(cat "$URUN/$n.pid" 2>/dev/null)" 2>/dev/null || true
+    rm -f "${URUN:?}/guard-${n:?}.sh"
+    ok "Removed cron program '$n' (log left at $URUN/$n.log)."
+  else
+    warn "No program named '$n'."
+  fi
+}
+
+cmd_uninstall() {
+  confirm "Remove system-protector (symlinks + unit)? Your configs/logs are kept." || return 0
+  if is_root; then
+    rm -f "${BIN_LINK:?}" "${CLI_LINK:?}" "${UNIT_LINK:?}"
+    have_systemd && systemctl daemon-reload || true
+  fi
+  rm -f "${UBIN:?}/protector" "${UBIN:?}/system-protector" 2>/dev/null || true
+  ok "Uninstalled. Project files in $REPO are untouched."
+}
+
+# =====================================================================
+# interactive menu
+# =====================================================================
+menu() {
+  while true; do
+    say ""
+    say "${B}system-protector${N} — keep a program alive even when it's killed"
+    installed && say "  status: ${G}installed${N}" || say "  status: ${Y}not installed${N}"
+    have_systemd && say "  backend: systemd" || say "  backend: cron fallback"
+    say ""
+    say "  1) Set up a new protected program"
+    say "  2) List protected programs"
+    say "  3) Status of a program"
+    say "  4) View logs"
+    say "  5) Remove a protected program"
+    say "  6) (Re)install system-protector onto PATH"
+    say "  7) Uninstall system-protector"
+    say "  0) Exit"
+    local ch=""; read -r -p "> " ch || true
+    case "$ch" in
+      1) cmd_add ;;
+      2) say ""; cmd_list ;;
+      3) cmd_status ;;
+      4) cmd_logs ;;
+      5) cmd_remove ;;
+      6) self_install ;;
+      7) cmd_uninstall ;;
+      0|q|Q) exit 0 ;;
+      "") : ;;
+      *) warn "Unknown choice." ;;
+    esac
+  done
+}
+
+# ---- dispatch ----
+case "${1:-}" in
+  self-install|install) self_install ;;
+  add)       shift; cmd_add ;;
+  list|ls)   cmd_list ;;
+  status)    shift; cmd_status "${1:-}" ;;
+  logs)      shift; cmd_logs "${1:-}" ;;
+  remove|rm) shift; cmd_remove "${1:-}" ;;
+  uninstall) cmd_uninstall ;;
+  ""|menu)   menu ;;
+  -h|--help|help)
+    cat <<'HELP'
+system-protector — keep a Linux program alive even when it's killed.
+
+Usage:
+  system-protector                 open the interactive menu
+  system-protector self-install    build + symlink onto PATH
+  system-protector add             set up a new protected program (interactive)
+  system-protector list            list protected programs
+  system-protector status <name>   show status of a program
+  system-protector logs <name>     tail a program's log
+  system-protector remove <name>   stop + remove a program
+  system-protector uninstall       remove system-protector itself
+HELP
+    ;;
+  *) err "Unknown command: $1"; say "Try: $0 --help"; exit 2 ;;
+esac

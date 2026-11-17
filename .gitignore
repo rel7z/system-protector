@@ -1,0 +1,6 @@
+# built watchdog binary (compile on the target machine)
+/protector
+*.o
+# editor / OS cruft
+*.swp
+.DS_Store

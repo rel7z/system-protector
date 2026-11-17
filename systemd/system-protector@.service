@@ -1,0 +1,40 @@
+# Template unit: one instance per protected program.
+#
+#   systemctl enable --now system-protector@myapp
+#
+# reads its settings from /etc/system-protector/myapp.conf
+#
+# Two layers of protection:
+#   * the protector watchdog respawns your program if it exits/is killed
+#   * systemd (Restart=always) respawns the watchdog if the WATCHDOG is killed
+
+[Unit]
+Description=System Protector watchdog for %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/system-protector/%i.conf
+
+# WorkingDirectory/User come from the conf file via systemd specifiers below.
+WorkingDirectory=${WORKDIR}
+
+# Run the watchdog, which runs your command through a shell so COMMAND can be
+# a full command line with arguments.
+ExecStart=/usr/local/bin/protector --name %i --logfile /var/log/system-protector/%i.log -- /bin/sh -c "exec ${COMMAND}"
+
+# Layer 2: if the watchdog itself dies, systemd brings it right back.
+Restart=always
+RestartSec=1
+
+# Make the watchdog a very unattractive target for the OOM killer.
+OOMScoreAdjust=-900
+
+# Keep the whole process tree together so stop/restart is clean.
+KillMode=control-group
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
