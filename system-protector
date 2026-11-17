@@ -310,7 +310,8 @@ menu() {
     say "  4) View logs"
     say "  5) Remove a protected program"
     say "  6) (Re)install system-protector onto PATH"
-    say "  7) Uninstall system-protector"
+    say "  7) Update from GitHub (safe rebuild)"
+    say "  8) Uninstall system-protector"
     say "  0) Exit"
     local ch=""; read -r -p "> " ch || true
     case "$ch" in
@@ -320,7 +321,8 @@ menu() {
       4) cmd_logs ;;
       5) cmd_remove ;;
       6) self_install ;;
-      7) cmd_uninstall ;;
+      7) [ -x "$REPO/update.sh" ] && "$REPO/update.sh" || warn "update.sh not found." ;;
+      8) cmd_uninstall ;;
       0|q|Q) exit 0 ;;
       "") : ;;
       *) warn "Unknown choice." ;;
@@ -337,6 +339,7 @@ case "${1:-}" in
   logs)      shift; cmd_logs "${1:-}" ;;
   remove|rm) shift; cmd_remove "${1:-}" ;;
   uninstall) cmd_uninstall ;;
+  update)    [ -x "$REPO/update.sh" ] || die "update.sh not found in $REPO"; exec "$REPO/update.sh" ;;
   ""|menu)   menu ;;
   -h|--help|help)
     cat <<'HELP'
@@ -350,6 +353,7 @@ Usage:
   system-protector status <name>   show status of a program
   system-protector logs <name>     tail a program's log
   system-protector remove <name>   stop + remove a program
+  system-protector update          pull latest from GitHub + rebuild safely
   system-protector uninstall       remove system-protector itself
 HELP
     ;;

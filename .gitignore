@@ -4,3 +4,5 @@
 # editor / OS cruft
 *.swp
 .DS_Store
+/protector.new
+/protector.bak

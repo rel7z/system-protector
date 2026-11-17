@@ -102,6 +102,30 @@ system-protector logs demo      # watch it get restarted in ~1s
 With systemd you can also `sudo kill -9` the `protector` process and watch
 systemd bring the watchdog right back.
 
+## Updating
+
+To pull the latest version from GitHub and rebuild **safely** (a broken update
+can't take your running programs down):
+
+```bash
+cd system-protector
+sudo ./update.sh          # or: system-protector update
+```
+
+It fast-forwards the repo, builds the new watchdog to a **temp file and
+smoke-tests it first**, and only swaps it in if that works (keeping the old one
+as `protector.bak`). Then it refreshes the symlinks and restarts each running
+instance onto the new binary. If the build or test fails, nothing changes and
+your programs keep running on the old binary.
+
+## Restart behavior
+
+- A program that was running fine and then **exits or is killed** is respawned
+  **immediately**, with no delay — forever.
+- A program that dies almost instantly (a real crash loop) is retried with a
+  short, growing backoff (up to `--max-backoff`) so it can't peg the CPU; as
+  soon as it stays up again, instant respawns resume.
+
 ## Run the watchdog directly (no install)
 
 ```bash
@@ -130,4 +154,5 @@ Everything after `--` is the command to protect, with its arguments.
 | `systemd/system-protector@.service` | systemd template unit (layer 2) |
 | `config/example.conf` | example program config |
 | `install.sh` / `uninstall.sh` | thin wrappers around the CLI |
+| `update.sh` | safe self-update from GitHub (build-test-swap-restart) |
 | `Makefile` | `make`, `make install`, `make clean` |

@@ -277,14 +277,19 @@ int main(int argc, char **argv) {
             log_msg("child ended (status %d) after %lds", status, ran);
         }
 
-        /* reset backoff if the child was healthy (stayed up long enough) */
-        if ((double)ran >= opt_healthy_secs) backoff = opt_min_backoff;
-
-        log_msg("restarting in %.2fs", backoff);
-        interruptible_sleep(backoff);
-
-        backoff = backoff * opt_backoff_factor;
-        if (backoff > opt_max_backoff) backoff = opt_max_backoff;
+        if ((double)ran >= opt_healthy_secs) {
+            /* It ran fine, so this was not a crash loop (e.g. it was killed, or
+             * finished a normal run). Respawn immediately, with no delay. */
+            backoff = opt_min_backoff;
+            log_msg("restarting immediately");
+        } else {
+            /* It died almost at once -- back off so a genuine crash loop can't
+             * peg the CPU. The delay grows until the program stays up again. */
+            log_msg("restarting in %.2fs", backoff);
+            interruptible_sleep(backoff);
+            backoff = backoff * opt_backoff_factor;
+            if (backoff > opt_max_backoff) backoff = opt_max_backoff;
+        }
     }
 
     log_msg("watchdog stopping");
